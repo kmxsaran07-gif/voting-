@@ -1,85 +1,106 @@
-import os, threading, time, csv
+import os, time, threading
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from pymongo import MongoClient
 from flask import Flask
-from datetime import datetime
 import pandas as pd
+from datetime import datetime
 
-# ============ CONFIG ============
+# ---------- CONFIG ----------
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URL = os.getenv("MONGO_URL")
 ADMINS = [int(x) for x in os.getenv("ADMINS").split(",")]
+FORCE_CHANNEL = os.getenv("FORCE_CHANNEL")  # @channelusername
 
-# ============ WEB ============
+# ---------- WEB (Render keep-alive) ----------
 app = Flask(__name__)
 @app.route("/")
 def home():
-    return "Voting Bot Running"
+    return "Voting bot running"
 
-def run_web():
+def web():
     app.run(host="0.0.0.0", port=10000)
 
-threading.Thread(target=run_web).start()
+threading.Thread(target=web).start()
 
-# ============ DB ============
+# ---------- DB ----------
 mongo = MongoClient(MONGO_URL)
-db = mongo["voting"]
+db = mongo.votingbot
 users = db.users
 candidates = db.candidates
-payments = db.payments
 settings = db.settings
 
-# Defaults
-if not settings.find_one({"_id": "config"}):
+if not settings.find_one({"_id": "cfg"}):
     settings.insert_one({
-        "_id": "config",
+        "_id": "cfg",
         "multi_vote": False,
-        "vote_open": True,
-        "rate_inr": 1,
-        "rate_star": 1
+        "vote_open": True
     })
 
-# ============ BOT ============
-bot = Client("votingbot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+def cfg():
+    return settings.find_one({"_id": "cfg"})
 
-# ============ HELPERS ============
-def is_admin(uid): return uid in ADMINS
+# ---------- BOT ----------
+bot = Client(
+    "votingbot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN
+)
 
-def cfg(): return settings.find_one({"_id": "config"})
+# ---------- HELPERS ----------
+async def joined(client, user_id):
+    try:
+        m = await client.get_chat_member(FORCE_CHANNEL, user_id)
+        return m.status not in ("left", "kicked")
+    except:
+        return False
 
-# ============ START ============
+# ---------- START ----------
 @bot.on_message(filters.command("start"))
 async def start(_, m):
     await m.reply(
-        "🗳️ **Advanced Voting Bot**\n\n"
-        "/vote\n/votes\n/myvote\n/leaderboard\n/help"
+        "🗳️ **Voting Bot**\n\n"
+        "/vote – Vote\n"
+        "/votes – Live votes\n"
+        "/myvote – Your vote\n"
+        "/leaderboard – Ranking"
     )
 
-# ============ ADD CANDIDATE ============
+# ---------- ADD CANDIDATE ----------
 @bot.on_message(filters.command("addcandidate") & filters.user(ADMINS))
 async def add_c(_, m):
     try:
         name = m.text.split(None,1)[1]
         candidates.insert_one({"name": name, "votes": 0})
-        await m.reply(f"✅ Added {name}")
+        await m.reply(f"✅ Added: {name}")
     except:
         await m.reply("Use: /addcandidate Name")
 
-# ============ VOTE ============
+# ---------- REMOVE CANDIDATE ----------
+@bot.on_message(filters.command("removecandidate") & filters.user(ADMINS))
+async def rem_c(_, m):
+    name = m.text.split(None,1)[1]
+    candidates.delete_one({"name": name})
+    await m.reply("🗑️ Removed")
+
+# ---------- VOTE ----------
 @bot.on_message(filters.command("vote"))
 async def vote(_, m):
     if not cfg()["vote_open"]:
         return await m.reply("❌ Voting closed")
 
-    if users.find_one({"uid": m.from_user.id}) and not cfg()["multi_vote"]:
-        return await m.reply("❌ Already voted")
+    if not await joined(bot, m.from_user.id):
+        return await m.reply(f"❌ Join {FORCE_CHANNEL} first")
 
-    btn = [[InlineKeyboardButton(c["name"], callback_data=f"v_{c['name']}")]
-           for c in candidates.find()]
-    await m.reply("Select candidate:", reply_markup=InlineKeyboardMarkup(btn))
+    if users.find_one({"uid": m.from_user.id}) and not cfg()["multi_vote"]:
+        return await m.reply("❌ You already voted")
+
+    buttons = [[InlineKeyboardButton(c["name"], callback_data=f"v_{c['name']}")]
+               for c in candidates.find()]
+    await m.reply("Choose candidate:", reply_markup=InlineKeyboardMarkup(buttons))
 
 @bot.on_callback_query(filters.regex("^v_"))
 async def do_vote(_, q):
@@ -93,48 +114,59 @@ async def do_vote(_, q):
     users.insert_one({"uid": uid, "vote": name})
     await q.message.edit_text(f"✅ Vote cast for **{name}**")
 
-# ============ LIVE VOTES ============
+# ---------- LIVE VOTES ----------
 @bot.on_message(filters.command("votes"))
-async def live(_, m):
-    txt = "📊 Live Votes\n\n"
+async def votes(_, m):
+    txt = "📊 **Live Votes**\n\n"
     for c in candidates.find():
         txt += f"{c['name']} : {c['votes']}\n"
     await m.reply(txt)
 
-# ============ MY VOTE ============
+# ---------- MY VOTE ----------
 @bot.on_message(filters.command("myvote"))
 async def myvote(_, m):
     v = users.find_one({"uid": m.from_user.id})
     await m.reply("❌ No vote" if not v else f"🗳️ You voted: {v['vote']}")
 
-# ============ LEADERBOARD ============
+# ---------- LEADERBOARD ----------
 @bot.on_message(filters.command("leaderboard"))
 async def lb(_, m):
-    txt = "🏆 Leaderboard\n\n"
+    txt = "🏆 **Leaderboard**\n\n"
     for c in candidates.find().sort("votes",-1):
         txt += f"{c['name']} : {c['votes']}\n"
     await m.reply(txt)
 
-# ============ ADMIN ============
-@bot.on_message(filters.command("setrate") & filters.user(ADMINS))
-async def rate(_, m):
-    r = m.text.split()
-    settings.update_one({"_id":"config"}, {"$set":{
-        "rate_inr": int(r[1]),
-        "rate_star": int(r[2])
-    }})
-    await m.reply("💰 Rates updated")
+# ---------- ADMIN ----------
+@bot.on_message(filters.command("multivote") & filters.user(ADMINS))
+async def mv(_, m):
+    state = m.text.split()[1].lower() == "on"
+    settings.update_one({"_id":"cfg"}, {"$set":{"multi_vote": state}})
+    await m.reply(f"Multi-vote {'ON' if state else 'OFF'}")
 
 @bot.on_message(filters.command("endvote") & filters.user(ADMINS))
 async def end(_, m):
-    settings.update_one({"_id":"config"}, {"$set":{"vote_open": False}})
+    settings.update_one({"_id":"cfg"}, {"$set":{"vote_open": False}})
     await m.reply("🔒 Voting closed")
 
 @bot.on_message(filters.command("resetvotes") & filters.user(ADMINS))
 async def reset(_, m):
     users.delete_many({})
     candidates.update_many({}, {"$set":{"votes":0}})
-    await m.reply("🔄 Reset done")
+    await m.reply("🔄 Votes reset")
+
+@bot.on_message(filters.command("broadcast") & filters.user(ADMINS))
+async def bc(_, m):
+    msg = m.text.split(None,1)[1]
+    for u in users.find():
+        try: await bot.send_message(u["uid"], msg)
+        except: pass
+    await m.reply("📢 Broadcast sent")
+
+@bot.on_message(filters.command("export") & filters.user(ADMINS))
+async def export(_, m):
+    df = pd.DataFrame(list(candidates.find({},{"_id":0})))
+    df.to_csv("results.csv", index=False)
+    await m.reply_document("results.csv")
 
 @bot.on_message(filters.command("winner") & filters.user(ADMINS))
 async def win(_, m):
@@ -142,11 +174,5 @@ async def win(_, m):
     for x in c:
         await m.reply(f"🏆 Winner: {x['name']} ({x['votes']})")
 
-@bot.on_message(filters.command("export") & filters.user(ADMINS))
-async def export(_, m):
-    df = pd.DataFrame(list(candidates.find({},{"_id":0})))
-    df.to_csv("result.csv", index=False)
-    await m.reply_document("result.csv")
-
-# ============ RUN ============
+# ---------- RUN ----------
 bot.run()
