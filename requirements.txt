@@ -1,0 +1,6 @@
+pyrogram
+tgcrypto
+pymongo
+dnspython
+flask
+pandas
